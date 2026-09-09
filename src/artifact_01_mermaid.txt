@@ -1,0 +1,50 @@
+flowchart TD
+    subgraph ClientLayer["User & Market Maker Layer"]
+        Maker["Maker (Client/HFMM)"]
+        Taker["Taker / Routing Aggregator"]
+        Keeper["Autonomous Keeper / Relayer"]
+    end
+
+    subgraph PDA_Escrows["PDA Storage & Account Model"]
+        GlobalConfig["Global Market Config PDA<br/>seeds: ['config', market_id]"]
+        MakerEscrow["Maker Escrow Vault PDA<br/>seeds: ['escrow', maker_pubkey, market_id]"]
+        OrderRegistry["Order Manifest (Zero-Copy)<br/>seeds: ['manifest', market_id]"]
+        SettlementVault["Settlement Vault (Base/Quote ATA)<br/>Authority: Market Config PDA"]
+    end
+
+    subgraph CoreEngine["HyperSpout Settlement Engine"]
+        BatchSettle["Instruction: batch_settle_orders()"]
+        CancelOrder["Instruction: bitmask_cancel()"]
+        DepositEscrow["Instruction: deposit_escrow()"]
+    end
+
+    subgraph SecurityGuards["Security & Verification Guards"]
+        OracleGuard["Pyth Feed Price Staleness Guard<br/>Max Latency: <= 15s, Conf Interval <= 1.5%"]
+        BitmaskGuard["Bitmask Replay & Reentrancy Guard"]
+        SignerCheck["Signer & Token Account Ownership Validation"]
+    end
+
+    subgraph SPL_Core["SPL Token / Solana Runtime"]
+        SPLProgram["SPL Token Program / Token-2022"]
+        MakerTokenAccount["Maker Base/Quote Token Account"]
+        TakerTokenAccount["Taker Base/Quote Token Account"]
+    end
+
+    Maker -->|"1. Deposit Margin / Tokens"| DepositEscrow
+    DepositEscrow -->|"Transfer CPI"| SPLProgram
+    SPLProgram -->|"Debit Maker ATA / Credit Escrow PDA"| MakerEscrow
+
+    Maker -->|"2. Off-Chain Signature / Manifest Register"| OrderRegistry
+
+    Keeper -->|"3. Trigger Atomic Fill Batch"| BatchSettle
+    BatchSettle -->|"Verify Max Deviation"| OracleGuard
+    BatchSettle -->|"Verify Nonce / Fill States"| BitmaskGuard
+    BatchSettle -->|"Verify Authority"| SignerCheck
+
+    BatchSettle -->|"4. Execute Atomic Settlement CPI"| SPLProgram
+    SPLProgram -->|"Credit Taker & Protocol Fee"| TakerTokenAccount
+    SPLProgram -->|"Update Balances & Rebalance"| SettlementVault
+    SPLProgram -->|"Discharge Yield / Rebate"| MakerEscrow
+
+    Maker -->|"Fast-Path Cancel"| CancelOrder
+    CancelOrder -->|"Flip Bitmask Flag (Zero CU)"| BitmaskGuard
