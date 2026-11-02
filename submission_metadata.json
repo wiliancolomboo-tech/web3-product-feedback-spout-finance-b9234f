@@ -1,0 +1,52 @@
+{
+  "deliverable_id": "superteam_3eb1dfb9234f",
+  "opportunity_id": "st-ae1041af-2378-4a17-b21f-8d74a4505f96",
+  "platform": "SuperteamEarn",
+  "title": "Product Feedback Spout Finance",
+  "url": "https://earn.superteam.fun/listings/bounty/product-feedback-spout-finance",
+  "budget": "1,000 USDC",
+  "prize_amount": 1000.0,
+  "ecosystem": "Solana",
+  "github_url": "https://github.com/wiliancolomboo-tech/web3-product-feedback-spout-finance-b9234f",
+  "status": "ready_for_submission",
+  "validation_reports": [
+    {
+      "file": "artifact_01_mermaid.txt",
+      "language": "mermaid",
+      "valid": true,
+      "error": null
+    },
+    {
+      "file": "artifact_02_rust.rs",
+      "language": "rust",
+      "valid": true,
+      "error": null
+    },
+    {
+      "file": "artifact_03_typescript.ts",
+      "language": "typescript",
+      "valid": true,
+      "error": null
+    },
+    {
+      "file": "artifact_04_txt.txt",
+      "language": "txt",
+      "valid": true,
+      "error": null
+    },
+    {
+      "file": "artifact_05_bash.sh",
+      "language": "bash",
+      "valid": true,
+      "error": null
+    },
+    {
+      "file": "artifact_06_text.txt",
+      "language": "text",
+      "valid": true,
+      "error": null
+    }
+  ],
+  "git_initialized": true,
+  "created_at": "2026-09-09 12:25:47"
+}

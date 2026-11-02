@@ -1,0 +1,51 @@
+flowchart TD
+    subgraph ClientLayer["Client & Keeper Layer"]
+        Sender["Stream Creator / Employer"]
+        Recipient["Beneficiary / Recipient"]
+        Keeper["Solana Crank / Keeper Bot"]
+    end
+
+    subgraph ProgramBoundary["Spout Finance Core Engine (Anchor Program)"]
+        direction TB
+        InitStream["ix: initialize_stream()"]
+        Withdraw["ix: withdraw_stream()"]
+        PauseResume["ix: toggle_stream_pause()"]
+        Cancel["ix: cancel_and_settle()"]
+        
+        subgraph MathEngine["Fixed-Point Math & Precision Engine"]
+            CalcWithdrawable["calc_withdrawable_amount(Clock::get())"]
+            CalcRefund["calc_unvested_refund()"]
+            InvariantCheck["assert!(withdrawn <= total_deposit)"]
+        end
+
+        subgraph PDA_Accounts["Account State & PDA Space"]
+            StreamState["Stream Account (PDA)\nseeds = ['stream', sender, recipient, stream_id]\n- rate_per_second: u64\n- total_amount: u64\n- withdrawn_amount: u64\n- start_time: i64\n- stop_time: i64\n- last_withdrawal_time: i64\n- is_paused: bool\n- paused_at: i64\n- total_paused_duration: u64"]
+            EscrowVault["Escrow Token Vault (PDA)\nseeds = ['vault', stream_state.key()]\nOwned by SPL Token Program"]
+        end
+    end
+
+    subgraph SolanaRuntime["Solana System & Token Programs"]
+        SPL["SPL Token Program / Token-2022"]
+        SysClock["Sysvar: Clock"]
+        Rent["Sysvar: Rent"]
+    end
+
+    Sender -->|"1. Initialize & Fund (Deposit SPL)"| InitStream
+    InitStream -->|"CPI: TransferChecked"| EscrowVault
+    InitStream -->|"Derive & Initialize State"| StreamState
+
+    Recipient -->|"2. Pull Vested Funds"| Withdraw
+    Keeper -.->|"Optional: Auto-crank pull"| Withdraw
+
+    Withdraw -->|"Query Current Slot Unix Timestamp"| SysClock
+    Withdraw -->|"Execute Pure Settlement Formula"| CalcWithdrawable
+    CalcWithdrawable -->|"Validate Non-Exceedance"| InvariantCheck
+    InvariantCheck -->|"Update state.withdrawn_amount"| StreamState
+    Withdraw -->|"CPI: Transfer to Recipient ATA"| SPL
+    SPL -->|"Debit"| EscrowVault
+
+    Sender -->|"3. Stop / Terminate Stream"| Cancel
+    Cancel -->|"Evaluate Earned vs Unearned"| CalcRefund
+    CalcRefund -->|"Payout Remaining Vested to Recipient"| SPL
+    CalcRefund -->|"Refund Remainder to Sender"| SPL
+    Cancel -->|"Close PDA & Deallocate Rent"| Sender

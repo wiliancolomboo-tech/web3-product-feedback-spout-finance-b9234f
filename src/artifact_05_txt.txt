@@ -1,0 +1,5 @@
+[00:00 - 00:20] THE HOOK: Identifying Spout Finance's Silent Failure Mode
+[00:20 - 00:50] ARCHITECTURAL CRITIQUE: Where Legacy Streams Break Down
+[00:50 - 01:25] THE SOLUTION: Spout StreamGuard Engine in Action
+[01:25 - 01:45] CODE PROOF & BENCHMARKS: CU Reductions & MEV Neutralization
+[01:45 - 02:00] THE CLOSE: Production-Ready Impact

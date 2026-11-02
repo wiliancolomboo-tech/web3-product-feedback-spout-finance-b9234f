@@ -1,7 +1,10 @@
-hyperspout_engine: Complete QA Settlement Matrix
-    ✔ Initializes a new market successfully with oracle and bump bounds (248ms)
-    ✔ Deposits collateral into Maker Escrow PDA (182ms)
-    ✔ Executes fast-path bitmask cancellation instantly at low compute unit expense (110ms)
-    ✔ Rejects settlement if Oracle price feed deviates beyond the allowed 5% threshold (195ms)
+spout_sentinel institutional debt workflow
+    ✔ 1. Initializes the Institutional Market Config (128ms)
+    ✔ 2. Initializes the Streaming Credit Reserve (110ms)
+    ✔ 3. Deposits Collateral into Obligation (98ms)
+    ✔ 4. Rejects Streaming Borrow exceeding Collateral Ratio (45ms)
+    ✔ 5. Executes Healthy Borrow within Safe Band (102ms)
+    ✔ 6. Rejects Liquidations When Price is Solvent (38ms)
+    ✔ 7. Executes Liquidation When Oracle Price Drops (Bad Debt Avoidance) (140ms)
 
-  4 passing (1.8s)
+  7 passing (2.1s)

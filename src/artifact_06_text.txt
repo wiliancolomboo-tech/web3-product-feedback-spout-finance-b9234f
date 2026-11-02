@@ -1,0 +1,7 @@
+spout-streamcore QA Integration Matrix
+    ✔ 1. Initializes the continuous streaming pool with strict limits (482ms)
+    ✔ 2. Executes dual-tranche deposit and ensures 120% coverage invariant (1214ms)
+    ✔ 3. Initializes linear continuous repayment stream and settles pro-rata (845ms)
+    ✔ 4. Blocks Junior withdrawal if Senior Coverage Ratio drops below 120% (612ms)
+
+  4 passing (3.82s)

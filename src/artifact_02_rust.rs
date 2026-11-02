@@ -1,356 +1,629 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{self, Token, TokenAccount, Transfer};
-use pyth_sdk_solana::load_price_feed_from_account_info;
+use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer, MintTo, Burn};
 
 declare_id!("Spout111111111111111111111111111111111111111");
 
-pub const MAX_BATCH_SIZE: usize = 16;
-pub const MAX_ORACLE_STALENESS_SECONDS: u64 = 30;
-pub const BASIS_POINTS_DIVISOR: u64 = 10_000;
+// Math Scaling Constants: 64-bit fixed point precision scaling factor
+const PRECISION_FACTOR: u128 = 1_000_000_000_000; // 1e12
+const SECONDS_PER_YEAR: u128 = 31_536_000;
+const MIN_SENIOR_COVERAGE_BPS: u16 = 12_000; // 120.00% minimum coverage ratio
 
 #[program]
-pub mod hyperspout_engine {
+pub mod spout_engine {
     use super::*;
 
-    pub fn initialize_market(
-        ctx: Context<InitializeMarket>,
-        market_id: u64,
-        fee_bps: u16,
-        oracle_price_feed: Pubkey,
+    pub fn initialize_pool(
+        ctx: Context<InitializePool>,
+        pool_id: u64,
+        senior_fixed_rate_bps: u16, // e.g., 800 = 8.00%
+        performance_fee_bps: u16,
     ) -> Result<()> {
-        let market = &mut ctx.accounts.market;
-        market.authority = ctx.accounts.authority.key();
-        market.market_id = market_id;
-        market.fee_bps = fee_bps;
-        market.oracle_price_feed = oracle_price_feed;
-        market.base_mint = ctx.accounts.base_mint.key();
-        market.quote_mint = ctx.accounts.quote_mint.key();
-        market.bump = ctx.bumps.market;
-        market.is_paused = false;
+        require!(senior_fixed_rate_bps <= 3000, SpoutError::InvalidInterestRate); // Cap at 30%
+        require!(performance_fee_bps <= 1000, SpoutError::InvalidFeeParameters);
+
+        let pool = &mut ctx.accounts.pool_state;
+        pool.admin = ctx.accounts.admin.key();
+        pool.pool_id = pool_id;
+        pool.underlying_mint = ctx.accounts.underlying_mint.key();
+        pool.senior_mint = ctx.accounts.senior_mint.key();
+        pool.junior_mint = ctx.accounts.junior_mint.key();
+        pool.escrow_vault = ctx.accounts.escrow_vault.key();
+        pool.senior_fixed_rate_bps = senior_fixed_rate_bps;
+        pool.performance_fee_bps = performance_fee_bps;
+        pool.last_settlement_timestamp = Clock::get()?.unix_timestamp;
+        pool.total_senior_principal = 0;
+        pool.total_junior_principal = 0;
+        pool.accrued_senior_yield = 0;
+        pool.unallocated_cash_drag = 0;
+        pool.bump = ctx.bumps.pool_state;
+        pool.escrow_bump = ctx.bumps.escrow_vault;
+        pool.is_paused = false;
+        pool.reentrancy_lock = false;
+
+        emit!(PoolInitializedEvent {
+            pool_id,
+            admin: pool.admin,
+            timestamp: pool.last_settlement_timestamp,
+        });
+
         Ok(())
     }
 
-    pub fn deposit_escrow(ctx: Context<DepositEscrow>, amount: u64) -> Result<()> {
-        require!(amount > 0, HyperSpoutError::ZeroDepositAmount);
+    pub fn deposit_senior(ctx: Context<DepositSenior>, amount: u64) -> Result<()> {
+        require!(amount > 0, SpoutError::ZeroDepositAmount);
+        let pool = &mut ctx.accounts.pool_state;
+        require!(!pool.is_paused, SpoutError::ProtocolPaused);
+        require!(!pool.reentrancy_lock, SpoutError::ReentrancyDetected);
+        pool.reentrancy_lock = true;
 
-        let escrow = &mut ctx.accounts.maker_escrow;
-        if escrow.owner == Pubkey::default() {
-            escrow.owner = ctx.accounts.maker.key();
-            escrow.market = ctx.accounts.market.key();
-            escrow.bump = ctx.bumps.maker_escrow;
-            escrow.active_orders_bitmask = 0;
-            escrow.deposited_balance = 0;
-        }
+        // Lazy settlement of accrued yield up to current timestamp
+        settle_internal_waterfall(pool, Clock::get()?.unix_timestamp)?;
 
-        escrow.deposited_balance = escrow
-            .deposited_balance
-            .checked_add(amount)
-            .ok_or(HyperSpoutError::MathOverflow)?;
-
-        // Execute CPI to SPL Token Program
+        // Transfer underlying assets from depositor to program escrow vault
         let cpi_accounts = Transfer {
-            from: ctx.accounts.maker_token_account.to_account_info(),
+            from: ctx.accounts.depositor_token_account.to_account_info(),
             to: ctx.accounts.escrow_vault.to_account_info(),
-            authority: ctx.accounts.maker.to_account_info(),
+            authority: ctx.accounts.depositor.to_account_info(),
         };
-        let cpi_program = ctx.accounts.token_program.to_account_info();
-        let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
+        let cpi_ctx = CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts);
         token::transfer(cpi_ctx, amount)?;
 
-        emit!(EscrowDeposited {
-            maker: ctx.accounts.maker.key(),
-            market: ctx.accounts.market.key(),
-            amount,
-        });
+        // Mint exact 1:1 spSEN tranche receipt tokens
+        let seeds = &[
+            b"spout_pool".as_ref(),
+            &pool.pool_id.to_le_bytes(),
+            &[pool.bump],
+        ];
+        let signer = &[&seeds[..]];
+        let mint_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            MintTo {
+                mint: ctx.accounts.senior_mint.to_account_info(),
+                to: ctx.accounts.depositor_senior_receipt.to_account_info(),
+                authority: pool.to_account_info(),
+            },
+            signer,
+        );
+        token::mint_to(mint_ctx, amount)?;
 
+        pool.total_senior_principal = pool
+            .total_senior_principal
+            .checked_add(amount)
+            .ok_or(SpoutError::MathOverflow)?;
+
+        pool.reentrancy_lock = false;
         Ok(())
     }
 
-    pub fn bitmask_cancel(ctx: Context<CancelOrder>, order_index: u8) -> Result<()> {
-        require!(order_index < 64, HyperSpoutError::InvalidOrderIndex);
-        let escrow = &mut ctx.accounts.maker_escrow;
-        
-        let mask = 1u64 << order_index;
-        require!((escrow.active_orders_bitmask & mask) != 0, HyperSpoutError::OrderAlreadyCancelled);
+    pub fn deposit_junior(ctx: Context<DepositJunior>, amount: u64) -> Result<()> {
+        require!(amount > 0, SpoutError::ZeroDepositAmount);
+        let pool = &mut ctx.accounts.pool_state;
+        require!(!pool.is_paused, SpoutError::ProtocolPaused);
+        require!(!pool.reentrancy_lock, SpoutError::ReentrancyDetected);
+        pool.reentrancy_lock = true;
 
-        // Clear bitmask flag
-        escrow.active_orders_bitmask &= !mask;
+        settle_internal_waterfall(pool, Clock::get()?.unix_timestamp)?;
 
-        emit!(OrderCancelled {
-            maker: ctx.accounts.maker.key(),
-            order_index,
-        });
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.depositor_token_account.to_account_info(),
+            to: ctx.accounts.escrow_vault.to_account_info(),
+            authority: ctx.accounts.depositor.to_account_info(),
+        };
+        let cpi_ctx = CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts);
+        token::transfer(cpi_ctx, amount)?;
 
+        let seeds = &[
+            b"spout_pool".as_ref(),
+            &pool.pool_id.to_le_bytes(),
+            &[pool.bump],
+        ];
+        let signer = &[&seeds[..]];
+        let mint_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            MintTo {
+                mint: ctx.accounts.junior_mint.to_account_info(),
+                to: ctx.accounts.depositor_junior_receipt.to_account_info(),
+                authority: pool.to_account_info(),
+            },
+            signer,
+        );
+        token::mint_to(mint_ctx, amount)?;
+
+        pool.total_junior_principal = pool
+            .total_junior_principal
+            .checked_add(amount)
+            .ok_or(SpoutError::MathOverflow)?;
+
+        pool.reentrancy_lock = false;
         Ok(())
     }
 
-    pub fn batch_settle_orders<'info>(
-        ctx: Context<'_, '_, '_, 'info, BatchSettle<'info>>,
-        fills: Vec<OrderFillManifest>,
+    pub fn initialize_stream(
+        ctx: Context<InitializeStream>,
+        flow_rate_per_sec: u64,
+        duration_seconds: i64,
     ) -> Result<()> {
-        let market = &ctx.accounts.market;
-        require!(!market.is_paused, HyperSpoutError::MarketPaused);
-        require!(fills.len() <= MAX_BATCH_SIZE, HyperSpoutError::BatchSizeExceeded);
-        require!(!fills.is_empty(), HyperSpoutError::EmptyBatch);
+        require!(flow_rate_per_sec > 0, SpoutError::InvalidFlowRate);
+        require!(duration_seconds > 0, SpoutError::InvalidDuration);
 
-        // 1. Validate Oracle Price Freshness
+        let stream = &mut ctx.accounts.stream_account;
         let clock = Clock::get()?;
-        let oracle_account_info = &ctx.accounts.oracle_account;
-        require_keys_eq!(oracle_account_info.key(), market.oracle_price_feed, HyperSpoutError::InvalidOracleAccount);
-        
-        let price_feed = load_price_feed_from_account_info(oracle_account_info)
-            .map_err(|_| HyperSpoutError::OracleParseFailure)?;
-        let current_price = price_feed
-            .get_price_no_older_than(clock.unix_timestamp, MAX_ORACLE_STALENESS_SECONDS)
-            .ok_or(HyperSpoutError::OraclePriceStale)?;
 
-        let oracle_price = current_price.price as u64;
+        stream.borrower = ctx.accounts.borrower.key();
+        stream.pool_id = ctx.accounts.pool_state.pool_id;
+        stream.flow_rate_per_sec = flow_rate_per_sec;
+        stream.start_time = clock.unix_timestamp;
+        stream.end_time = clock.unix_timestamp.checked_add(duration_seconds).ok_or(SpoutError::MathOverflow)?;
+        stream.last_amortized_time = clock.unix_timestamp;
+        stream.total_debt_drawn = (flow_rate_per_sec as u128)
+            .checked_mul(duration_seconds as u128)
+            .ok_or(SpoutError::MathOverflow)? as u64;
+        stream.total_debt_settled = 0;
+        stream.bump = ctx.bumps.stream_account;
 
-        // 2. Iterate and Execute Multi-Leg Match Engine
-        let market_id = market.market_id;
-        let bump = market.bump;
-        let signer_seeds: &[&[&[u8]]] = &[&[b"market", market_id.to_le_bytes().as_ref(), &[bump]]];
+        Ok(())
+    }
 
-        for fill in fills.iter() {
-            // Price corridor safety assertion against oracle: Max 5% deviation allowed
-            let min_allowed_price = oracle_price.saturating_mul(9500) / BASIS_POINTS_DIVISOR;
-            let max_allowed_price = oracle_price.saturating_mul(10500) / BASIS_POINTS_DIVISOR;
-            require!(
-                fill.execution_price >= min_allowed_price && fill.execution_price <= max_allowed_price,
-                HyperSpoutError::PriceSlippageExceeded
-            );
+    pub fn stream_repay_continuous(ctx: Context<StreamRepayContinuous>, amount: u64) -> Result<()> {
+        require!(amount > 0, SpoutError::ZeroRepayAmount);
+        let stream = &mut ctx.accounts.stream_account;
+        let pool = &mut ctx.accounts.pool_state;
 
-            // Compute protocol fees and maker/taker amounts
-            let gross_amount = fill.base_amount
-                .checked_mul(fill.execution_price)
-                .ok_or(HyperSpoutError::MathOverflow)?
-                / 1_000_000; // Base decimals scale correction
+        require!(!pool.reentrancy_lock, SpoutError::ReentrancyDetected);
+        pool.reentrancy_lock = true;
 
-            let protocol_fee = gross_amount
-                .checked_mul(market.fee_bps as u64)
-                .ok_or(HyperSpoutError::MathOverflow)?
-                / BASIS_POINTS_DIVISOR;
+        let current_time = Clock::get()?.unix_timestamp;
+        settle_internal_waterfall(pool, current_time)?;
 
-            let net_maker_receive = gross_amount
-                .checked_sub(protocol_fee)
-                .ok_or(HyperSpoutError::MathOverflow)?;
+        // Transfer continuous repayment tokens into the escrow vault
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.borrower_token_account.to_account_info(),
+            to: ctx.accounts.escrow_vault.to_account_info(),
+            authority: ctx.accounts.borrower.to_account_info(),
+        };
+        let cpi_ctx = CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts);
+        token::transfer(cpi_ctx, amount)?;
 
-            // Transfer Quote Asset: Taker -> Maker Escrow PDA Vault
-            let transfer_taker_to_maker = Transfer {
-                from: ctx.accounts.taker_quote_vault.to_account_info(),
-                to: ctx.accounts.maker_quote_vault.to_account_info(),
-                authority: ctx.accounts.taker.to_account_info(),
-            };
-            token::transfer(
-                CpiContext::new(ctx.accounts.token_program.to_account_info(), transfer_taker_to_maker),
-                net_maker_receive,
-            )?;
+        stream.total_debt_settled = stream
+            .total_debt_settled
+            .checked_add(amount)
+            .ok_or(SpoutError::MathOverflow)?;
+        stream.last_amortized_time = current_time;
 
-            // Transfer Base Asset: Maker PDA Escrow Vault -> Taker ATA
-            let transfer_maker_to_taker = Transfer {
-                from: ctx.accounts.market_base_vault.to_account_info(),
-                to: ctx.accounts.taker_base_vault.to_account_info(),
-                authority: ctx.accounts.market.to_account_info(),
-            };
-            token::transfer(
-                CpiContext::new_with_signer(
-                    ctx.accounts.token_program.to_account_info(),
-                    transfer_maker_to_taker,
-                    signer_seeds,
-                ),
-                fill.base_amount,
-            )?;
-        }
+        // Allocate directly to unallocated liquidity pool for tranche distributions
+        pool.unallocated_cash_drag = pool
+            .unallocated_cash_drag
+            .checked_add(amount)
+            .ok_or(SpoutError::MathOverflow)?;
 
+        pool.reentrancy_lock = false;
+        Ok(())
+    }
+
+    pub fn withdraw_senior(ctx: Context<WithdrawSenior>, shares_to_burn: u64) -> Result<()> {
+        require!(shares_to_burn > 0, SpoutError::ZeroWithdrawAmount);
+        let pool = &mut ctx.accounts.pool_state;
+        require!(!pool.reentrancy_lock, SpoutError::ReentrancyDetected);
+        pool.reentrancy_lock = true;
+
+        settle_internal_waterfall(pool, Clock::get()?.unix_timestamp)?;
+
+        // Compute pro-rata share of senior capital + fixed yield
+        let senior_total = pool.total_senior_principal
+            .checked_add(pool.accrued_senior_yield)
+            .ok_or(SpoutError::MathOverflow)?;
+        let senior_mint_supply = ctx.accounts.senior_mint.supply;
+        require!(senior_mint_supply > 0, SpoutError::DivisionByZero);
+
+        let payout_amount = ((shares_to_burn as u128)
+            .checked_mul(senior_total as u128)
+            .ok_or(SpoutError::MathOverflow)?)
+            .checked_div(senior_mint_supply as u128)
+            .ok_or(SpoutError::MathOverflow)? as u64;
+
+        // Burn recipient LP tokens
+        let burn_ctx = CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            Burn {
+                mint: ctx.accounts.senior_mint.to_account_info(),
+                from: ctx.accounts.depositor_senior_receipt.to_account_info(),
+                authority: ctx.accounts.depositor.to_account_info(),
+            },
+        );
+        token::burn(burn_ctx, shares_to_burn)?;
+
+        // Transfer payout from escrow
+        let seeds = &[
+            b"spout_pool".as_ref(),
+            &pool.pool_id.to_le_bytes(),
+            &[pool.bump],
+        ];
+        let signer = &[&seeds[..]];
+
+        let cpi_transfer = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            Transfer {
+                from: ctx.accounts.escrow_vault.to_account_info(),
+                to: ctx.accounts.depositor_token_account.to_account_info(),
+                authority: pool.to_account_info(),
+            },
+            signer,
+        );
+        token::transfer(cpi_transfer, payout_amount)?;
+
+        // Adjust pool state
+        pool.total_senior_principal = pool.total_senior_principal.saturating_sub(payout_amount);
+
+        pool.reentrancy_lock = false;
         Ok(())
     }
 }
 
-// -------------------------------------------------------------------------------------------------
-// Account Contexts
-// -------------------------------------------------------------------------------------------------
+// --------------------------------------------------------------------------------
+// INTERNAL LAZY-EVALUATION SETTLEMENT ENGINE
+// --------------------------------------------------------------------------------
+fn settle_internal_waterfall(pool: &mut Account<PoolState>, current_time: i64) -> Result<()> {
+    if current_time <= pool.last_settlement_timestamp {
+        return Ok(());
+    }
 
+    let time_delta = (current_time - pool.last_settlement_timestamp) as u128;
+    if time_delta == 0 || pool.total_senior_principal == 0 {
+        pool.last_settlement_timestamp = current_time;
+        return Ok(());
+    }
+
+    // Senior yield computation: (Principal * Rate * Delta) / (YEAR * 10000)
+    let rate_scaled = pool.senior_fixed_rate_bps as u128;
+    let continuous_nominal_yield = (pool.total_senior_principal as u128)
+        .checked_mul(rate_scaled)
+        .ok_or(SpoutError::MathOverflow)?
+        .checked_mul(time_delta)
+        .ok_or(SpoutError::MathOverflow)?
+        .checked_div(SECONDS_PER_YEAR * 10_000)
+        .ok_or(SpoutError::MathOverflow)? as u64;
+
+    // Satisfy senior yield from unallocated cash drag first
+    let senior_yield_satisfied = std::cmp::min(continuous_nominal_yield, pool.unallocated_cash_drag);
+    pool.accrued_senior_yield = pool
+        .accrued_senior_yield
+        .checked_add(senior_yield_satisfied)
+        .ok_or(SpoutError::MathOverflow)?;
+    pool.unallocated_cash_drag = pool
+        .unallocated_cash_drag
+        .checked_sub(senior_yield_satisfied)
+        .ok_or(SpoutError::MathOverflow)?;
+
+    // Minimum Senior Coverage Verification Guard:
+    // (Escrow - Accrued Yield) / Senior Principal >= MIN_SENIOR_COVERAGE_BPS
+    if pool.total_senior_principal > 0 {
+        let total_liabilities = pool.total_senior_principal
+            .checked_add(pool.accrued_senior_yield)
+            .ok_or(SpoutError::MathOverflow)?;
+        let total_assets = pool.total_senior_principal
+            .checked_add(pool.total_junior_principal)
+            .checked_add(pool.unallocated_cash_drag)
+            .ok_or(SpoutError::MathOverflow)?;
+
+        let current_cr_bps = (total_assets as u128)
+            .checked_mul(10_000)
+            .ok_or(SpoutError::MathOverflow)?
+            .checked_div(total_liabilities as u128)
+            .unwrap_or(0) as u16;
+
+        require!(current_cr_bps >= MIN_SENIOR_COVERAGE_BPS, SpoutError::CoverageRatioBreached);
+    }
+
+    pool.last_settlement_timestamp = current_time;
+    Ok(())
+}
+
+// --------------------------------------------------------------------------------
+// ACCOUNT VALIDATION STRUCTS
+// --------------------------------------------------------------------------------
 #[derive(Accounts)]
-#[instruction(market_id: u64)]
-pub struct InitializeMarket<'info> {
+#[instruction(pool_id: u64)]
+pub struct InitializePool<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+
     #[account(
         init,
-        payer = authority,
-        space = 8 + MarketConfig::LEN,
-        seeds = [b"market", market_id.to_le_bytes().as_ref()],
+        payer = admin,
+        space = 8 + PoolState::INIT_SPACE,
+        seeds = [b"spout_pool", pool_id.to_le_bytes().as_ref()],
         bump
     )]
-    pub market: Account<'info, MarketConfig>,
-    pub base_mint: Account<'info, token::Mint>,
-    pub quote_mint: Account<'info, token::Mint>,
-    #[account(mut)]
-    pub authority: Signer<'info>,
+    pub pool_state: Account<'info, PoolState>,
+
+    pub underlying_mint: Account<'info, Mint>,
+
+    #[account(
+        init,
+        payer = admin,
+        mint::decimals = underlying_mint.decimals,
+        mint::authority = pool_state,
+        seeds = [b"senior_mint", pool_id.to_le_bytes().as_ref()],
+        bump
+    )]
+    pub senior_mint: Account<'info, Mint>,
+
+    #[account(
+        init,
+        payer = admin,
+        mint::decimals = underlying_mint.decimals,
+        mint::authority = pool_state,
+        seeds = [b"junior_mint", pool_id.to_le_bytes().as_ref()],
+        bump
+    )]
+    pub junior_mint: Account<'info, Mint>,
+
+    #[account(
+        init,
+        payer = admin,
+        token::mint = underlying_mint,
+        token::authority = pool_state,
+        seeds = [b"escrow_vault", pool_id.to_le_bytes().as_ref()],
+        bump
+    )]
+    pub escrow_vault: Account<'info, TokenAccount>,
+
     pub system_program: Program<'info, System>,
+    pub token_program: Program<'info, Token>,
     pub rent: Sysvar<'info, Rent>,
 }
 
 #[derive(Accounts)]
-pub struct DepositEscrow<'info> {
-    #[account(
-        init_if_needed,
-        payer = maker,
-        space = 8 + MakerEscrow::LEN,
-        seeds = [b"escrow", maker.key().as_ref(), market.key().as_ref()],
-        bump
-    )]
-    pub maker_escrow: Account<'info, MakerEscrow>,
+pub struct DepositSenior<'info> {
     #[account(mut)]
-    pub market: Account<'info, MarketConfig>,
+    pub depositor: Signer<'info>,
+
     #[account(
         mut,
-        constraint = maker_token_account.owner == maker.key(),
-        constraint = maker_token_account.mint == market.base_mint
+        seeds = [b"spout_pool", pool_state.pool_id.to_le_bytes().as_ref()],
+        bump = pool_state.bump
     )]
-    pub maker_token_account: Account<'info, TokenAccount>,
+    pub pool_state: Account<'info, PoolState>,
+
     #[account(
         mut,
-        constraint = escrow_vault.mint == market.base_mint
+        address = pool_state.senior_mint
+    )]
+    pub senior_mint: Account<'info, Mint>,
+
+    #[account(
+        mut,
+        address = pool_state.escrow_vault
     )]
     pub escrow_vault: Account<'info, TokenAccount>,
-    #[account(mut)]
-    pub maker: Signer<'info>,
+
+    #[account(
+        mut,
+        constraint = depositor_token_account.owner == depositor.key(),
+        constraint = depositor_token_account.mint == pool_state.underlying_mint
+    )]
+    pub depositor_token_account: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        constraint = depositor_senior_receipt.owner == depositor.key(),
+        constraint = depositor_senior_receipt.mint == pool_state.senior_mint
+    )]
+    pub depositor_senior_receipt: Account<'info, TokenAccount>,
+
     pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct DepositJunior<'info> {
+    #[account(mut)]
+    pub depositor: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [b"spout_pool", pool_state.pool_id.to_le_bytes().as_ref()],
+        bump = pool_state.bump
+    )]
+    pub pool_state: Account<'info, PoolState>,
+
+    #[account(
+        mut,
+        address = pool_state.junior_mint
+    )]
+    pub junior_mint: Account<'info, Mint>,
+
+    #[account(
+        mut,
+        address = pool_state.escrow_vault
+    )]
+    pub escrow_vault: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        constraint = depositor_token_account.owner == depositor.key(),
+        constraint = depositor_token_account.mint == pool_state.underlying_mint
+    )]
+    pub depositor_token_account: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        constraint = depositor_junior_receipt.owner == depositor.key(),
+        constraint = depositor_junior_receipt.mint == pool_state.junior_mint
+    )]
+    pub depositor_junior_receipt: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct InitializeStream<'info> {
+    #[account(mut)]
+    pub borrower: Signer<'info>,
+
+    pub pool_state: Account<'info, PoolState>,
+
+    #[account(
+        init,
+        payer = borrower,
+        space = 8 + StreamLedger::INIT_SPACE,
+        seeds = [b"stream", pool_state.pool_id.to_le_bytes().as_ref(), borrower.key().as_ref()],
+        bump
+    )]
+    pub stream_account: Account<'info, StreamLedger>,
+
     pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
-pub struct CancelOrder<'info> {
-    #[account(
-        mut,
-        has_one = owner @ HyperSpoutError::UnauthorizedSigner,
-        seeds = [b"escrow", owner.key().as_ref(), market.key().as_ref()],
-        bump = maker_escrow.bump
-    )]
-    pub maker_escrow: Account<'info, MakerEscrow>,
-    pub market: Account<'info, MarketConfig>,
-    pub owner: Signer<'info>,
-}
-
-#[derive(Accounts)]
-pub struct BatchSettle<'info> {
-    #[account(
-        mut,
-        seeds = [b"market", market.market_id.to_le_bytes().as_ref()],
-        bump = market.bump
-    )]
-    pub market: Account<'info, MarketConfig>,
-    /// CHECK: Validated dynamically against market.oracle_price_feed
-    pub oracle_account: AccountInfo<'info>,
+pub struct StreamRepayContinuous<'info> {
     #[account(mut)]
-    pub taker: Signer<'info>,
+    pub borrower: Signer<'info>,
+
     #[account(
         mut,
-        constraint = taker_quote_vault.owner == taker.key(),
-        constraint = taker_quote_vault.mint == market.quote_mint
+        seeds = [b"spout_pool", pool_state.pool_id.to_le_bytes().as_ref()],
+        bump = pool_state.bump
     )]
-    pub taker_quote_vault: Account<'info, TokenAccount>,
+    pub pool_state: Account<'info, PoolState>,
+
     #[account(
         mut,
-        constraint = taker_base_vault.owner == taker.key(),
-        constraint = taker_base_vault.mint == market.base_mint
+        seeds = [b"stream", pool_state.pool_id.to_le_bytes().as_ref(), borrower.key().as_ref()],
+        bump = stream_account.bump,
+        has_one = borrower
     )]
-    pub taker_base_vault: Account<'info, TokenAccount>,
+    pub stream_account: Account<'info, StreamLedger>,
+
     #[account(
         mut,
-        constraint = market_base_vault.mint == market.base_mint
+        address = pool_state.escrow_vault
     )]
-    pub market_base_vault: Account<'info, TokenAccount>,
+    pub escrow_vault: Account<'info, TokenAccount>,
+
     #[account(
         mut,
-        constraint = maker_quote_vault.mint == market.quote_mint
+        constraint = borrower_token_account.owner == borrower.key(),
+        constraint = borrower_token_account.mint == pool_state.underlying_mint
     )]
-    pub maker_quote_vault: Account<'info, TokenAccount>,
-    pub keeper: Signer<'info>,
+    pub borrower_token_account: Account<'info, TokenAccount>,
+
     pub token_program: Program<'info, Token>,
 }
 
-// -------------------------------------------------------------------------------------------------
-// State & Data Structs
-// -------------------------------------------------------------------------------------------------
+#[derive(Accounts)]
+pub struct WithdrawSenior<'info> {
+    #[account(mut)]
+    pub depositor: Signer<'info>,
 
+    #[account(
+        mut,
+        seeds = [b"spout_pool", pool_state.pool_id.to_le_bytes().as_ref()],
+        bump = pool_state.bump
+    )]
+    pub pool_state: Account<'info, PoolState>,
+
+    #[account(
+        mut,
+        address = pool_state.senior_mint
+    )]
+    pub senior_mint: Account<'info, Mint>,
+
+    #[account(
+        mut,
+        address = pool_state.escrow_vault
+    )]
+    pub escrow_vault: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        constraint = depositor_token_account.owner == depositor.key(),
+        constraint = depositor_token_account.mint == pool_state.underlying_mint
+    )]
+    pub depositor_token_account: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        constraint = depositor_senior_receipt.owner == depositor.key(),
+        constraint = depositor_senior_receipt.mint == pool_state.senior_mint
+    )]
+    pub depositor_senior_receipt: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+// --------------------------------------------------------------------------------
+// STATE DEFINITIONS
+// --------------------------------------------------------------------------------
 #[account]
-pub struct MarketConfig {
-    pub authority: Pubkey,
-    pub market_id: u64,
-    pub base_mint: Pubkey,
-    pub quote_mint: Pubkey,
-    pub oracle_price_feed: Pubkey,
-    pub fee_bps: u16,
+#[derive(InitSpace)]
+pub struct PoolState {
+    pub admin: Pubkey,
+    pub pool_id: u64,
+    pub underlying_mint: Pubkey,
+    pub senior_mint: Pubkey,
+    pub junior_mint: Pubkey,
+    pub escrow_vault: Pubkey,
+    pub senior_fixed_rate_bps: u16,
+    pub performance_fee_bps: u16,
+    pub last_settlement_timestamp: i64,
+    pub total_senior_principal: u64,
+    pub total_junior_principal: u64,
+    pub accrued_senior_yield: u64,
+    pub unallocated_cash_drag: u64,
     pub bump: u8,
+    pub escrow_bump: u8,
     pub is_paused: bool,
-}
-
-impl MarketConfig {
-    pub const LEN: usize = 32 + 8 + 32 + 32 + 32 + 2 + 1 + 1;
+    pub reentrancy_lock: bool,
 }
 
 #[account]
-pub struct MakerEscrow {
-    pub owner: Pubkey,
-    pub market: Pubkey,
-    pub deposited_balance: u64,
-    pub active_orders_bitmask: u64,
+#[derive(InitSpace)]
+pub struct StreamLedger {
+    pub borrower: Pubkey,
+    pub pool_id: u64,
+    pub flow_rate_per_sec: u64,
+    pub start_time: i64,
+    pub end_time: i64,
+    pub last_amortized_time: i64,
+    pub total_debt_drawn: u64,
+    pub total_debt_settled: u64,
     pub bump: u8,
 }
 
-impl MakerEscrow {
-    pub const LEN: usize = 32 + 32 + 8 + 8 + 1;
-}
-
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug)]
-pub struct OrderFillManifest {
-    pub maker: Pubkey,
-    pub order_index: u8,
-    pub base_amount: u64,
-    pub execution_price: u64,
-}
-
-// -------------------------------------------------------------------------------------------------
-// Events & Errors
-// -------------------------------------------------------------------------------------------------
-
+// --------------------------------------------------------------------------------
+// EVENTS & ERRORS
+// --------------------------------------------------------------------------------
 #[event]
-pub struct EscrowDeposited {
-    pub maker: Pubkey,
-    pub market: Pubkey,
-    pub amount: u64,
-}
-
-#[event]
-pub struct OrderCancelled {
-    pub maker: Pubkey,
-    pub order_index: u8,
+pub struct PoolInitializedEvent {
+    pub pool_id: u64,
+    pub admin: Pubkey,
+    pub timestamp: i64,
 }
 
 #[error_code]
-pub enum HyperSpoutError {
-    #[msg("Amount must be greater than zero.")]
+pub enum SpoutError {
+    #[msg("Provided interest rate exceeds maximum protocol ceiling")]
+    InvalidInterestRate,
+    #[msg("Protocol fee parameters exceed maximum permitted bounds")]
+    InvalidFeeParameters,
+    #[msg("Deposit amount must be strictly greater than zero")]
     ZeroDepositAmount,
-    #[msg("Math arithmetic overflow.")]
+    #[msg("Repay amount must be strictly greater than zero")]
+    ZeroRepayAmount,
+    #[msg("Withdraw amount must be strictly greater than zero")]
+    ZeroWithdrawAmount,
+    #[msg("Protocol functions are temporarily paused by governance")]
+    ProtocolPaused,
+    #[msg("Reentrant call intercepted by security guard")]
+    ReentrancyDetected,
+    #[msg("Mathematical overflow encountered during calculation")]
     MathOverflow,
-    #[msg("Order index out of range (0-63).")]
-    InvalidOrderIndex,
-    #[msg("Order already marked cancelled or filled.")]
-    OrderAlreadyCancelled,
-    #[msg("Market trading is currently paused.")]
-    MarketPaused,
-    #[msg("Batch size exceeds system maximum (16).")]
-    BatchSizeExceeded,
-    #[msg("Batch payload is empty.")]
-    EmptyBatch,
-    #[msg("Supplied oracle account address does not match market configuration.")]
-    InvalidOracleAccount,
-    #[msg("Failed to parse Pyth oracle data.")]
-    OracleParseFailure,
-    #[msg("Pyth oracle price feed is stale or confidence threshold unverified.")]
-    OraclePriceStale,
-    #[msg("Execution price violates oracle deviation safety corridors (Max 5%).")]
-    PriceSlippageExceeded,
-    #[msg("Unauthorized signer for escrow operation.")]
-    UnauthorizedSigner,
+    #[msg("Continuous stream flow rate must exceed zero tokens per second")]
+    InvalidFlowRate,
+    #[msg("Stream duration must be positive")]
+    InvalidDuration,
+    #[msg("Division by zero in liquidity calculation")]
+    DivisionByZero,
+    #[msg("Senior tranche coverage ratio breached! Junior tranche locked")]
+    CoverageRatioBreached,
 }

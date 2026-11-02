@@ -1,50 +1,61 @@
 flowchart TD
-    subgraph ClientLayer["User & Market Maker Layer"]
-        Maker["Maker (Client/HFMM)"]
-        Taker["Taker / Routing Aggregator"]
-        Keeper["Autonomous Keeper / Relayer"]
+    %% Styling Definitions
+    classDef userClass fill:#1E293B,stroke:#38BDF8,stroke-width:2px,color:#F8FAFC;
+    classDef programClass fill:#0F172A,stroke:#818CF8,stroke-width:2px,color:#F8FAFC;
+    classDef pdaClass fill:#1E1B4B,stroke:#C084FC,stroke-width:2px,color:#F8FAFC;
+    classDef cpiClass fill:#064E3B,stroke:#34D399,stroke-width:2px,color:#F8FAFC;
+    classDef guardClass fill:#450A0A,stroke:#F87171,stroke-width:2px,color:#F8FAFC;
+
+    subgraph ExternalActors["External Actors & Oracles"]
+        SeniorLP["Senior LP (Fixed APY, Low Risk)"]:::userClass
+        JuniorLP["Junior LP (Variable APY, First-Loss)"]:::userClass
+        Borrower["Institutional Borrower / Stream Initiator"]:::userClass
+        Keeper["Autonomous Keeper / Liquidator"]:::userClass
+        PythOracle["Pyth / Switchboard Push Oracle"]:::cpiClass
     end
 
-    subgraph PDA_Escrows["PDA Storage & Account Model"]
-        GlobalConfig["Global Market Config PDA<br/>seeds: ['config', market_id]"]
-        MakerEscrow["Maker Escrow Vault PDA<br/>seeds: ['escrow', maker_pubkey, market_id]"]
-        OrderRegistry["Order Manifest (Zero-Copy)<br/>seeds: ['manifest', market_id]"]
-        SettlementVault["Settlement Vault (Base/Quote ATA)<br/>Authority: Market Config PDA"]
+    subgraph SpoutCore["Spout-StreamCore Engine (Program ID: Spout111111111111111111111111111111111111111)"]
+        StateVault["Pool Config & State PDA<br/>seeds = [b'spout_pool', pool_id]"]:::pdaClass
+        SeniorVault["Senior Tranche Ledger PDA<br/>seeds = [b'senior_tranche', pool_id]"]:::pdaClass
+        JuniorVault["Junior Tranche Ledger PDA<br/>seeds = [b'junior_tranche', pool_id]"]:::pdaClass
+        StreamLedger["Continuous Stream Ledger PDA<br/>seeds = [b'stream', pool_id, borrower]"]:::pdaClass
+
+        subgraph InvariantGuards["Security Guards & Invariants"]
+            GuardCR["Coverage Ratio Guard:<br/>CR_senior >= Min Threshold"]:::guardClass
+            GuardStaleness["Oracle Staleness Guard:<br/>clock.unix_timestamp - last_update <= 60s"]:::guardClass
+            GuardReentrancy["Reentrancy Lock:<br/>pool_state.reentrancy_flag == 0"]:::guardClass
+        end
+
+        subgraph ExecutionLogic["Instruction Processors (CU Optimized)"]
+            InitPool["initialize_pool()"]:::programClass
+            StreamRepay["stream_repay_continuous()"]:::programClass
+            WaterfallSettle["settle_lazy_waterfall()"]:::programClass
+            WithdrawTranche["withdraw_senior_junior()"]:::programClass
+        end
     end
 
-    subgraph CoreEngine["HyperSpout Settlement Engine"]
-        BatchSettle["Instruction: batch_settle_orders()"]
-        CancelOrder["Instruction: bitmask_cancel()"]
-        DepositEscrow["Instruction: deposit_escrow()"]
+    subgraph SPLAccounts["On-Chain Escrows (SPL Token Engine)"]
+        VaultTokenAccount["Underlying Collateral Escrow<br/>seeds = [b'vault_escrow', pool_id]"]:::pdaClass
+        SeniorTokenMint["Senior Tranche Receipt Token (spSEN)"]:::pdaClass
+        JuniorTokenMint["Junior Tranche Receipt Token (spJUN)"]:::pdaClass
     end
 
-    subgraph SecurityGuards["Security & Verification Guards"]
-        OracleGuard["Pyth Feed Price Staleness Guard<br/>Max Latency: <= 15s, Conf Interval <= 1.5%"]
-        BitmaskGuard["Bitmask Replay & Reentrancy Guard"]
-        SignerCheck["Signer & Token Account Ownership Validation"]
-    end
+    %% Interactions
+    Borrower -->|"1. Repay Stream (Continuous)"| StreamRepay
+    StreamRepay -->|"Validate Clock Delta"| GuardStaleness
+    StreamRepay -->|"Lazy Update Accrual"| StreamLedger
+    StreamRepay -->|"CPI: Transfer Funds"| VaultTokenAccount
 
-    subgraph SPL_Core["SPL Token / Solana Runtime"]
-        SPLProgram["SPL Token Program / Token-2022"]
-        MakerTokenAccount["Maker Base/Quote Token Account"]
-        TakerTokenAccount["Taker Base/Quote Token Account"]
-    end
+    SeniorLP -->|"Deposit Base Asset"| WaterfallSettle
+    JuniorLP -->|"Deposit Base Asset"| WaterfallSettle
+    WaterfallSettle -->|"Verify Solvency"| GuardCR
+    WaterfallSettle -->|"Mint Receipt Tokens"| SeniorTokenMint
+    WaterfallSettle -->|"Mint Junior Tokens"| JuniorTokenMint
 
-    Maker -->|"1. Deposit Margin / Tokens"| DepositEscrow
-    DepositEscrow -->|"Transfer CPI"| SPLProgram
-    SPLProgram -->|"Debit Maker ATA / Credit Escrow PDA"| MakerEscrow
+    Keeper -->|"Trigger Batch Settlement"| WaterfallSettle
+    PythOracle -.->|"Read Price Feed"| GuardCR
 
-    Maker -->|"2. Off-Chain Signature / Manifest Register"| OrderRegistry
-
-    Keeper -->|"3. Trigger Atomic Fill Batch"| BatchSettle
-    BatchSettle -->|"Verify Max Deviation"| OracleGuard
-    BatchSettle -->|"Verify Nonce / Fill States"| BitmaskGuard
-    BatchSettle -->|"Verify Authority"| SignerCheck
-
-    BatchSettle -->|"4. Execute Atomic Settlement CPI"| SPLProgram
-    SPLProgram -->|"Credit Taker & Protocol Fee"| TakerTokenAccount
-    SPLProgram -->|"Update Balances & Rebalance"| SettlementVault
-    SPLProgram -->|"Discharge Yield / Rebate"| MakerEscrow
-
-    Maker -->|"Fast-Path Cancel"| CancelOrder
-    CancelOrder -->|"Flip Bitmask Flag (Zero CU)"| BitmaskGuard
+    SeniorLP -->|"Redeem Principal + Fixed Yield"| WithdrawTranche
+    JuniorLP -->|"Redeem Residual Yield"| WithdrawTranche
+    WithdrawTranche -->|"Check Reentrancy"| GuardReentrancy
+    WithdrawTranche -->|"CPI: Release Escrowed Asset"| VaultTokenAccount

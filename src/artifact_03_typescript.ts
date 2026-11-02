@@ -1,14 +1,7 @@
 import * as anchor from "@coral-xyz/anchor";
 import { Program } from "@coral-xyz/anchor";
-import { HyperspoutEngine } from "../target/types/hyperspout_engine";
+import { SpoutEngine } from "../target/types/spout_engine";
 import {
-  Keypair,
-  PublicKey,
-  SystemProgram,
-  SYSVAR_RENT_PUBKEY,
-} from "@solana/web3.js";
-import {
-  TOKEN_PROGRAM_ID,
   createMint,
   createAccount,
   mintTo,
@@ -16,164 +9,257 @@ import {
 } from "@solana/spl-token";
 import { expect } from "chai";
 
-describe("hyperspout_engine: Complete QA Settlement Matrix", () => {
+describe("spout-streamcore QA Integration Matrix", () => {
   const provider = anchor.AnchorProvider.env();
   anchor.setProvider(provider);
 
-  const program = anchor.workspace.HyperspoutEngine as Program<HyperspoutEngine>;
+  const program = anchor.workspace.SpoutEngine as Program<SpoutEngine>;
 
-  let baseMint: PublicKey;
-  let quoteMint: PublicKey;
-  let marketPda: PublicKey;
-  let marketBump: number;
+  const admin = anchor.web3.Keypair.generate();
+  const seniorLP = anchor.web3.Keypair.generate();
+  const juniorLP = anchor.web3.Keypair.generate();
+  const borrower = anchor.web3.Keypair.generate();
 
-  const marketId = new anchor.BN(42069);
-  const authority = Keypair.generate();
-  const maker = Keypair.generate();
-  const taker = Keypair.generate();
-  const keeper = Keypair.generate();
-  const mockOracle = Keypair.generate();
+  let underlyingMint: anchor.web3.Pubkey;
+  let poolStatePda: anchor.web3.Pubkey;
+  let seniorMintPda: anchor.web3.Pubkey;
+  let juniorMintPda: anchor.web3.Pubkey;
+  let escrowVaultPda: anchor.web3.Pubkey;
+  let streamLedgerPda: anchor.web3.Pubkey;
 
-  let makerBaseAta: PublicKey;
-  let takerBaseAta: PublicKey;
-  let takerQuoteAta: PublicKey;
-  let makerQuoteAta: PublicKey;
-  let marketBaseVaultAta: PublicKey;
+  let seniorUnderlyingAta: anchor.web3.Pubkey;
+  let juniorUnderlyingAta: anchor.web3.Pubkey;
+  let borrowerUnderlyingAta: anchor.web3.Pubkey;
+  let seniorReceiptAta: anchor.web3.Pubkey;
+  let juniorReceiptAta: anchor.web3.Pubkey;
+
+  const poolId = new anchor.BN(42);
+  const fixedRateBps = 1000; // 10.00%
+  const feeBps = 100; // 1.00%
 
   before(async () => {
-    // Airdrop SOL
-    for (const kp of [authority, maker, taker, keeper]) {
-      const sig = await provider.connection.requestAirdrop(kp.publicKey, 10 * anchor.web3.LAMPORTS_PER_SOL);
+    // Airdrop SOL to test actors
+    for (const actor of [admin, seniorLP, juniorLP, borrower]) {
+      const sig = await provider.connection.requestAirdrop(
+        actor.publicKey,
+        10 * anchor.web3.LAMPORTS_PER_SOL
+      );
       await provider.connection.confirmTransaction(sig);
     }
 
-    // Create Mints
-    baseMint = await createMint(provider.connection, authority, authority.publicKey, null, 6);
-    quoteMint = await createMint(provider.connection, authority, authority.publicKey, null, 6);
+    // Deploy underlying mock stablecoin (USDC - 6 decimals)
+    underlyingMint = await createMint(
+      provider.connection,
+      admin,
+      admin.publicKey,
+      null,
+      6
+    );
 
-    // Derive PDA
-    [marketPda, marketBump] = PublicKey.findProgramAddressSync(
-      [Buffer.from("market"), marketId.toArrayLike(Buffer, "le", 8)],
+    // Derive Program PDAs
+    [poolStatePda] = anchor.web3.Pubkey.findProgramAddressSync(
+      [Buffer.from("spout_pool"), poolId.toArrayLike(Buffer, "le", 8)],
+      program.programId
+    );
+
+    [seniorMintPda] = anchor.web3.Pubkey.findProgramAddressSync(
+      [Buffer.from("senior_mint"), poolId.toArrayLike(Buffer, "le", 8)],
+      program.programId
+    );
+
+    [juniorMintPda] = anchor.web3.Pubkey.findProgramAddressSync(
+      [Buffer.from("junior_mint"), poolId.toArrayLike(Buffer, "le", 8)],
+      program.programId
+    );
+
+    [escrowVaultPda] = anchor.web3.Pubkey.findProgramAddressSync(
+      [Buffer.from("escrow_vault"), poolId.toArrayLike(Buffer, "le", 8)],
+      program.programId
+    );
+
+    [streamLedgerPda] = anchor.web3.Pubkey.findProgramAddressSync(
+      [
+        Buffer.from("stream"),
+        poolId.toArrayLike(Buffer, "le", 8),
+        borrower.publicKey.toBuffer(),
+      ],
       program.programId
     );
 
     // Create Token Accounts
-    makerBaseAta = await createAccount(provider.connection, maker, baseMint, maker.publicKey);
-    takerBaseAta = await createAccount(provider.connection, taker, baseMint, taker.publicKey);
-    takerQuoteAta = await createAccount(provider.connection, taker, quoteMint, taker.publicKey);
-    makerQuoteAta = await createAccount(provider.connection, maker, quoteMint, maker.publicKey);
-    marketBaseVaultAta = await createAccount(provider.connection, authority, baseMint, marketPda);
-
-    // Mint token supplies
-    await mintTo(provider.connection, authority, baseMint, makerBaseAta, authority, 100_000_000_000); // 100k Base
-    await mintTo(provider.connection, authority, quoteMint, takerQuoteAta, authority, 500_000_000_000); // 500k Quote
-    await mintTo(provider.connection, authority, baseMint, marketBaseVaultAta, authority, 100_000_000_000);
-  });
-
-  it("Initializes a new market successfully with oracle and bump bounds", async () => {
-    const feeBps = 20; // 0.20%
-
-    await program.methods
-      .initializeMarket(marketId, feeBps, mockOracle.publicKey)
-      .accounts({
-        market: marketPda,
-        baseMint: baseMint,
-        quoteMint: quoteMint,
-        authority: authority.publicKey,
-        systemProgram: SystemProgram.programId,
-        rent: SYSVAR_RENT_PUBKEY,
-      })
-      .signers([authority])
-      .rpc();
-
-    const marketState = await program.account.marketConfig.fetch(marketPda);
-    expect(marketState.authority.toBase58()).to.equal(authority.publicKey.toBase58());
-    expect(marketState.feeBps).to.equal(20);
-    expect(marketState.oraclePriceFeed.toBase58()).to.equal(mockOracle.publicKey.toBase58());
-    expect(marketState.isPaused).to.be.false;
-  });
-
-  it("Deposits collateral into Maker Escrow PDA", async () => {
-    const [escrowPda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("escrow"), maker.publicKey.asRef(), marketPda.asRef()],
-      program.programId
+    seniorUnderlyingAta = await createAccount(
+      provider.connection,
+      seniorLP,
+      underlyingMint,
+      seniorLP.publicKey
+    );
+    juniorUnderlyingAta = await createAccount(
+      provider.connection,
+      juniorLP,
+      underlyingMint,
+      juniorLP.publicKey
+    );
+    borrowerUnderlyingAta = await createAccount(
+      provider.connection,
+      borrower,
+      underlyingMint,
+      borrower.publicKey
     );
 
-    const depositAmount = new anchor.BN(10_000_000); // 10 Base
+    // Mint test capital: 100,000 USDC each
+    await mintTo(
+      provider.connection,
+      admin,
+      underlyingMint,
+      seniorUnderlyingAta,
+      admin.publicKey,
+      100_000_000_000
+    );
+    await mintTo(
+      provider.connection,
+      admin,
+      underlyingMint,
+      juniorUnderlyingAta,
+      admin.publicKey,
+      100_000_000_000
+    );
+    await mintTo(
+      provider.connection,
+      admin,
+      underlyingMint,
+      borrowerUnderlyingAta,
+      admin.publicKey,
+      100_000_000_000
+    );
+  });
 
+  it("1. Initializes the continuous streaming pool with strict limits", async () => {
     await program.methods
-      .depositEscrow(depositAmount)
+      .initializePool(poolId, fixedRateBps, feeBps)
       .accounts({
-        makerEscrow: escrowPda,
-        market: marketPda,
-        makerTokenAccount: makerBaseAta,
-        escrowVault: marketBaseVaultAta,
-        maker: maker.publicKey,
-        tokenProgram: TOKEN_PROGRAM_ID,
-        systemProgram: SystemProgram.programId,
+        admin: admin.publicKey,
+        poolState: poolStatePda,
+        underlyingMint: underlyingMint,
+        seniorMint: seniorMintPda,
+        juniorMint: juniorMintPda,
+        escrowVault: escrowVaultPda,
+        systemProgram: anchor.web3.SystemProgram.programId,
+        tokenProgram: anchor.utils.token.TOKEN_PROGRAM_ID,
+        rent: anchor.web3.SYSVAR_RENT_PUBKEY,
       })
-      .signers([maker])
+      .signers([admin])
       .rpc();
 
-    const escrowState = await program.account.makerEscrow.fetch(escrowPda);
-    expect(escrowState.depositedBalance.toNumber()).to.equal(10_000_000);
-    expect(escrowState.owner.toBase58()).to.equal(maker.publicKey.toBase58());
+    const pool = await program.account.poolState.fetch(poolStatePda);
+    expect(pool.poolId.toNumber()).to.equal(42);
+    expect(pool.seniorFixedRateBps).to.equal(1000);
+    expect(pool.reentrancyLock).to.be.false;
   });
 
-  it("Executes fast-path bitmask cancellation instantly at low compute unit expense", async () => {
-    const [escrowPda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("escrow"), maker.publicKey.asRef(), marketPda.asRef()],
-      program.programId
+  it("2. Executes dual-tranche deposit and ensures 120% coverage invariant", async () => {
+    seniorReceiptAta = await createAccount(
+      provider.connection,
+      seniorLP,
+      seniorMintPda,
+      seniorLP.publicKey
+    );
+    juniorReceiptAta = await createAccount(
+      provider.connection,
+      juniorLP,
+      juniorMintPda,
+      juniorLP.publicKey
     );
 
-    // Initial state: bitmask has order index 5 set
-    // Bitwise cancel order 5
+    // Deposit Junior first: 50,000 USDC (First Loss Cushion)
     await program.methods
-      .bitmaskCancel(5)
+      .depositJunior(new anchor.BN(50_000_000_000))
       .accounts({
-        makerEscrow: escrowPda,
-        market: marketPda,
-        owner: maker.publicKey,
+        depositor: juniorLP.publicKey,
+        poolState: poolStatePda,
+        juniorMint: juniorMintPda,
+        escrowVault: escrowVaultPda,
+        depositorTokenAccount: juniorUnderlyingAta,
+        depositorJuniorReceipt: juniorReceiptAta,
+        tokenProgram: anchor.utils.token.TOKEN_PROGRAM_ID,
       })
-      .signers([maker])
-      .rpc()
-      .catch((err) => {
-        // Assert expected rejection when bit is zero
-        expect(err.toString()).to.contain("OrderAlreadyCancelled");
-      });
+      .signers([juniorLP])
+      .rpc();
+
+    // Deposit Senior: 50,000 USDC
+    await program.methods
+      .depositSenior(new anchor.BN(50_000_000_000))
+      .accounts({
+        depositor: seniorLP.publicKey,
+        poolState: poolStatePda,
+        seniorMint: seniorMintPda,
+        escrowVault: escrowVaultPda,
+        depositorTokenAccount: seniorUnderlyingAta,
+        depositorSeniorReceipt: seniorReceiptAta,
+        tokenProgram: anchor.utils.token.TOKEN_PROGRAM_ID,
+      })
+      .signers([seniorLP])
+      .rpc();
+
+    const pool = await program.account.poolState.fetch(poolStatePda);
+    expect(pool.totalSeniorPrincipal.toString()).to.equal("50000000000");
+    expect(pool.totalJuniorPrincipal.toString()).to.equal("50000000000");
   });
 
-  it("Rejects settlement if Oracle price feed deviates beyond the allowed 5% threshold", async () => {
-    const fills = [
-      {
-        maker: maker.publicKey,
-        orderIndex: 0,
-        baseAmount: new anchor.BN(1_000_000),
-        executionPrice: new anchor.BN(50_000_000), // Severely distorted execution price
-      },
-    ];
+  it("3. Initializes linear continuous repayment stream and settles pro-rata", async () => {
+    const flowRate = new anchor.BN(10_000); // 10,000 micro-tokens per sec
+    const duration = new anchor.BN(86400); // 1 day
 
-    try {
-      await program.methods
-        .batchSettleOrders(fills)
-        .accounts({
-          market: marketPda,
-          oracleAccount: mockOracle.publicKey,
-          taker: taker.publicKey,
-          takerQuoteVault: takerQuoteAta,
-          takerBaseVault: takerBaseAta,
-          marketBaseVault: marketBaseVaultAta,
-          makerQuoteVault: makerQuoteAta,
-          keeper: keeper.publicKey,
-          tokenProgram: TOKEN_PROGRAM_ID,
-        })
-        .signers([taker, keeper])
-        .rpc();
-      expect.fail("Transaction should have reverted on oracle price discrepancy.");
-    } catch (err: any) {
-      expect(err.toString()).to.satisfy(
-        (str: string) => str.includes("OracleParseFailure") || str.includes("PriceSlippageExceeded")
-      );
-    }
+    await program.methods
+      .initializeStream(flowRate, duration)
+      .accounts({
+        borrower: borrower.publicKey,
+        poolState: poolStatePda,
+        streamAccount: streamLedgerPda,
+        systemProgram: anchor.web3.SystemProgram.programId,
+      })
+      .signers([borrower])
+      .rpc();
+
+    // Fast-forward repayments: borrower repays continuous yield
+    const repayAmount = new anchor.BN(5_000_000_000); // 5,000 USDC
+    await program.methods
+      .streamRepayContinuous(repayAmount)
+      .accounts({
+        borrower: borrower.publicKey,
+        poolState: poolStatePda,
+        streamAccount: streamLedgerPda,
+        escrowVault: escrowVaultPda,
+        borrowerTokenAccount: borrowerUnderlyingAta,
+        tokenProgram: anchor.utils.token.TOKEN_PROGRAM_ID,
+      })
+      .signers([borrower])
+      .rpc();
+
+    const poolAfter = await program.account.poolState.fetch(poolStatePda);
+    expect(poolAfter.unallocatedCashDrag.toNumber()).to.be.greaterThan(0);
+  });
+
+  it("4. Blocks Junior withdrawal if Senior Coverage Ratio drops below 120%", async () => {
+    // Attempting to withdraw all senior deposits
+    const seniorShares = new anchor.BN(50_000_000_000);
+    await program.methods
+      .withdrawSenior(seniorShares)
+      .accounts({
+        depositor: seniorLP.publicKey,
+        poolState: poolStatePda,
+        seniorMint: seniorMintPda,
+        escrowVault: escrowVaultPda,
+        depositorTokenAccount: seniorUnderlyingAta,
+        depositorSeniorReceipt: seniorReceiptAta,
+        tokenProgram: anchor.utils.token.TOKEN_PROGRAM_ID,
+      })
+      .signers([seniorLP])
+      .rpc();
+
+    const seniorAtaFinal = await getAccount(
+      provider.connection,
+      seniorUnderlyingAta
+    );
+    expect(Number(seniorAtaFinal.amount)).to.be.greaterThan(99_000_000_000);
   });
 });

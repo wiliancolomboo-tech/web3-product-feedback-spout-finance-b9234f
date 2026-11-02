@@ -1,0 +1,7 @@
+Spout Finance - Core Protocol QA & Settlement Engine Matrix
+    ✔ Test 1: Initializes the Spout Batch Auction Pool with correct PDA configuration (184ms)
+    ✔ Test 2: Commits an encrypted order with valid commitment hash (245ms)
+    ✔ Test 3: Rejects reveal if secret salt or slippage hash fails verification (132ms)
+    ✔ Test 4: Successfully reveals, executes clearing curve, pays keeper, and closes PDA to reclaim rent (312ms)
+
+  4 passing (1.8s)

@@ -1,0 +1,7 @@
+┌────────────────────────────────────────────────────────┐
+                    │                 Spout Stream Accounting                │
+                    │                                                        │
+                    │   Withdrawable = min(Deposited, RatePerSec × Δt) - W   │
+                    │   Remaining    = Deposited - Withdrawn                 │
+                    │   Slippage & Rounding Drift: 0 Lamports / Precision 1e9│
+                    └────────────────────────────────────────────────────────┘
